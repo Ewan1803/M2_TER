@@ -1,0 +1,419 @@
+---
+title: "NIRS Processing"
+output: html_notebook
+---
+
+# Preambule
+
+```{r preamble, warning=FALSE}
+# ------ CLEANING R SESSION ####
+rm(list=ls()) # clean environment window
+graphics.off() # clean plot window
+
+# ------ PACKAGE LOADING ####
+library(writexl) # to export .xlxs file
+library(here) # to load data in the project data folder
+library(dplyr) # to use infix operator %>%
+library(tidyverse)
+library(naniar) # to use replace_with_na_all function
+library(pracma) # to have findpeaks functions
+library(ggplot2) # to plot data
+library(bspec) # to compute the power-spectrum density
+library(gsignal) # to compute the power-spectrum density
+library(readxl) # to load excel file
+library(stringr) # to check if a string contains specific characters
+library(ggpubr) # to have the ggarange function
+library(ggpmisc) # to have the stat_poly_eq function
+
+# ------ FUNCTION AND EXTERN FILES CALL ####
+source(here("motimus_params.R"))
+source(here("r_functions/read_excel_allsheets.R"))
+source(here("r_functions/plots.R"))
+```
+
+# Formate the data
+
+```{r}
+# ------ CREATE A MATRIX WITH .csv FILES NAMES
+file_names <- matrix(list.files(path = "C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code\\data_filtered",
+                                pattern = ".txt"),
+                     nrow = 18,
+                     byrow = TRUE) # to list all files
+
+# ------ PREPARE DATA STORAGE
+# ------ Build empty list
+list_cond <- list()
+data_per_index <- list()
+
+# ------ COMPUTE DV
+for (participant in 1:18) {
+  
+  # ------ Find participant id
+  participant_id <- 
+    as.numeric(substring(file_names[participant, 1], 5, 6))
+  
+  for (condition in 1:nb_condition) {
+    
+    # ------ Load the channels-to-remove file
+    file_sci <- read_excel_allsheets("C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code\\motimus_report_sci.xlsx")
+  
+    
+    # ------ Read data file
+    filtered_data <- read.table(file.path("C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code\\data_filtered",file_names[participant, condition]),
+                                header = FALSE,
+                                stringsAsFactors = FALSE,
+                                sep = "\t",
+                                fill = TRUE) # load the data file
+    
+    # ------ Keep only data from a specific trigger
+    file2work <- filtered_data[, c(1, # time
+                                   first(which(str_detect(filtered_data[1,], as.character(10)))):
+                                     last(which(str_detect(filtered_data[1,], as.character(10)))))] # marker 10
+    
+    # ------ Format the data file
+    colnames(file2work) <- substr(file2work[2, ], 5, 15) # remove "HRF" from strings
+    file2work <- file2work[-c(1:2), ] # delete useless rows
+    file2work <- as.data.frame(sapply(file2work, as.numeric)) # transform values as numeric
+    
+    # ------ Divide data by index
+    data_per_index[[1]] <- select(file2work, matches("HbO"))
+    data_per_index[[2]] <- select(file2work, matches("HbR"))
+    data_per_index[[3]] <- select(file2work, matches("HbT"))
+    
+    # Rename list items
+    names(data_per_index) <- c("HbO", "HbR", "HbT")
+    
+    # Reorganise columns to match channel number
+    for (i in 1:3){
+      data_per_index[[i]] <- data_per_index[[i]][, c(1, 2, 4, 3, 7, 5, 8, 6, 10,
+                                                     9, 13, 11, 12, 14, 15, 19,
+                                                     16, 17, 20, 21, 18, 22, 23,
+                                                     24, 25, 26)]
+    }
+    
+    # ------ Merge data per condition and ROI while removing channels with poor SCI
+    # Build participant index vector
+    participant_index = seq(1, 100, by = 3)
+    current_idx = participant_index[participant]
+    
+    # Compute mean fNIRS response
+    list_cond[[condition]] <-
+      cbind(time = file2work[, 1],
+            oxy_orbito = 
+              rowMeans(
+                data_per_index[["HbO"]][, c(file_sci[[1]][which(file_sci[[1]][current_idx + condition] == 1), 1]) ]
+              ),
+            oxy_dlpfc =
+              rowMeans(
+                data_per_index[["HbO"]][, c(file_sci[[2]][which(file_sci[[2]][current_idx + condition] == 1), 1]) ]
+              ),
+            oxy_lpc =
+              rowMeans(
+                data_per_index[["HbO"]][, c(file_sci[[3]][which(file_sci[[3]][current_idx + condition] == 1), 1]) ]
+              ),
+            oxy_occipital =
+              rowMeans(
+                data_per_index[["HbO"]][, c(file_sci[[4]][which(file_sci[[4]][current_idx + condition] == 1), 1]) ]
+              ) )
+    
+  }
+
+  # ------ Rename list elements
+  names(list_cond) <- c("audiobook", "control", "music")
+  
+  # ------ Save participant matrix
+  save(list_cond,
+       file = paste0(here("C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code"),
+                     sprintf("sub-%03d.rData", participant_id)))
+  
+}
+
+```
+
+# Fit polynomial function
+
+```{r}
+# ------ CREATE A MATRIX WITH .csv FILES NAMES
+file_names <- matrix(list.files(path = "C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan",
+                                pattern = ".rData"),
+                     byrow = TRUE) # to list all files
+
+files_markers <- matrix(list.files(path = "C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code\\markers_time",
+                                   pattern = ".xlsx"),
+                        nrow = 1,
+                        byrow = TRUE) # to list all files
+
+# ------ Build empty lists
+list_max_polynomial <- list()
+list_coeff_linear <- list()
+
+# ------ FIT FUNCTIONS
+for (participant in 1:18) { # SG: Ewan, you'll need to update the total number of participants here if I can export some more
+  
+  # ------ Build empty matrices and lists
+  time_max <- matrix(nrow = 3, # number of conditions
+                     ncol = 4) # number of roi
+  colnames(time_max) <- c("orbito","dlpfc","parietal","occipital")
+    
+  coeff_linear <- matrix(nrow = 3, # number of conditions
+                         ncol = 4 * 2) # number of roi * number of coefficients
+  colnames(coeff_linear) <- c("orbito_intercept", "dlpfc_intercept", "parietal_intercept",
+                              "occipital_intercept", "orbito_slope", "dlpfc_slope", "parietal_slope",
+                              "occipital_slope")
+  list_plot <- list()
+  
+  # ------ Find participant id
+  participant_id <- 
+    as.numeric(substring(file_names[participant, 1], 9,11))
+  
+  # ------ Read data file
+  load(paste0("C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\",
+              file_names[participant]))
+  
+  # Remove the 20-s buffer on each side of the signal
+  list_cond <- lapply(list_cond, tail, - (nirs_fs * 20))
+  list_cond <- lapply(list_cond, head, - (nirs_fs * 20))
+  
+  # ------ Read marker file for the current participant
+  markers_file <- read_excel(paste0("C:\\Users\\ewanm\\OneDrive\\Documents\\M2\\TER\\Motimus\\data\\first_results_ewan\\code\\markers_time\\", files_markers[participant])) # markers file
+  
+  for (condition in 1:nb_condition){
+    
+    # ------ FIT POLYNOMIAL FUNCTION
+    polynomial_fit <-
+      lm(cbind(oxy_orbito, oxy_dlpfc, oxy_lpc, oxy_occipital) ~ time + I(time ^ 2) + I(time ^ 3),
+         data = as.data.frame(list_cond[[condition]]))
+    
+    # ------ Save the time of function maximum value
+    time_max[condition, ] <- list_cond[[condition]][apply(predict(polynomial_fit), 2, which.max), 1]
+    
+    # ------ FIT LINEAR FUNCTION
+    # ------ On the whole signal: parietal & occipital ROIs
+    linear_fit = lm(cbind(oxy_lpc, oxy_occipital) ~ time,
+                    data = as.data.frame(list_cond[[condition]]))
+    
+    # Save coefficient values
+    coeff_linear[condition, 3:4] <- linear_fit[[1]][1, ] # intercept
+    coeff_linear[condition, 7:8] <- linear_fit[[1]][2, ] # slope
+    
+    # ------ PLOT MODELISATIONS
+    for (roi in 1:4) {
+      
+      # ------ FIT LINEAR FUNCTION
+      # ------ Only until max polynomial value: orbitofrontal & dlPFC ROIs
+      if (roi == 1) {
+        
+        if (time_max[condition, roi] == 0){
+          
+          # Save coefficient values
+          coeff_linear[condition, 1] <- NA # intercept
+          coeff_linear[condition, 5] <- NA # slope
+          
+        } else {
+          
+          linear_fit =
+            lm(oxy_orbito ~ time,
+               data = as.data.frame(list_cond[[condition]][which(list_cond[[condition]][, 1] == 0):
+                                                             which(list_cond[[condition]][, 1] == time_max[condition, roi]), ]))
+          
+          # Save coefficient values
+          coeff_linear[condition, 1] <- linear_fit[[1]][1] # intercept
+          coeff_linear[condition, 5] <- linear_fit[[1]][2] # slope
+          
+        }
+        
+        
+        
+      } else if (roi == 2) {
+        
+        if (time_max[condition, roi] == 0){
+          
+          # Save coefficient values
+          coeff_linear[condition, 2] <- NA # intercept
+          coeff_linear[condition, 6] <- NA # slope
+          
+        } else {
+          
+          linear_fit =
+            lm(oxy_dlpfc ~ time,
+               data = as.data.frame(list_cond[[condition]][which(list_cond[[condition]][, 1] == 0):
+                                                             which(list_cond[[condition]][, 1] == time_max[condition, roi]), ]))
+          
+          # Save coefficient values
+          coeff_linear[condition, 2] <- linear_fit[[1]][1] # intercept
+          coeff_linear[condition, 6] <- linear_fit[[1]][2] # slope
+          
+        }
+
+      }
+
+       # ------ Plot
+       # Extract name of current ROI
+       if (roi == 1) {
+         name_roi = "Orbitofrontal Cortex"
+       } else if (roi == 2) {
+         name_roi = "Dorsolateral Prefrontal Cortex"
+       } else if (roi == 3){
+         name_roi = "Lateral Parietal Cortex"
+       } else if (roi == 4) {
+         name_roi = "Occipital Cortex"
+       }
+  
+       # Extract data to plot (currently, the two dfs are the same)
+       df_to_plot <- as.data.frame(list_cond[[condition]][, c(1, roi + 1)])
+       names(df_to_plot) <- c("time", "oxy")
+       df_to_plot_linear <- df_to_plot[c(which(df_to_plot$time == 0):
+                                           which(df_to_plot$time == time_max[condition, roi])), ]
+       names(df_to_plot_linear) <- c("time", "oxy_linear")
+  
+       if (roi == 1 | roi == 2) {
+  
+         # Build the plot
+         plot_roi <-
+           ggplot(data = df_to_plot,
+                  aes(x = time, y = oxy)) +
+           geom_line(linewidth = 0.5) +
+           geom_smooth(method = "lm", formula = y ~ x + I(x ^ 2) + I(x ^ 3),
+                       lwd = 1.5) + # polynomial model
+           stat_poly_eq(formula = y ~ x + I(x ^ 2) + I(x ^ 3),
+                        aes(label = paste(after_stat(rr.label), sep = "*\", \"*")), # after_stat(eq.label)
+                        geom = "label",
+                        label.y = 0.70 * max(df_to_plot$oxy),
+                        label.x = 0.15 * max(df_to_plot$time),
+                        color = "blue") +
+           geom_vline(xintercept = time_max[condition, roi],
+                     lwd = 1.5, linetype  ="dashed", color = "blue") +  # max value
+           geom_vline(xintercept = 0, lwd = 1, linetype  ="dashed") + # first trigger
+           geom_vline(xintercept = as.numeric(markers_file[condition, 10]),
+                      lwd = 1,linetype = "dashed") + # last trigger
+           geom_smooth(data = df_to_plot_linear,
+                       aes(x = time,
+                           y = oxy_linear),
+                       method = 'lm', formula = y ~ x,
+                       col = "red", lwd = 1.5) + # linear model
+           stat_poly_eq(data = df_to_plot_linear,
+                        aes(x = time,
+                            y = oxy_linear,
+                            label = paste(after_stat(eq.label),
+                                          # after_stat(adj.rr.label),
+                                          after_stat(rr.label), sep = "*\", \"*")),
+                        formula =  y ~ x,
+                        geom = "label",
+                        label.y = 0.95 * max(df_to_plot$oxy),
+                        label.x = 0.34 * max(df_to_plot$time),
+                        color = "red") +
+               labs(x = "Time (s)",
+                    y = "Oxygenated Hemoglobin",
+                    subtitle = name_roi) +
+               apa7
+  
+       } else if (roi == 3 | roi == 4){
+  
+         # Build the plot
+         plot_roi <-
+           ggplot(data = df_to_plot,
+                  aes(x = time, y = oxy)) +
+           geom_line(linewidth = 0.5) +
+           geom_vline(xintercept = 0, lwd = 1, linetype  ="dashed") + # first trigger
+           geom_vline(xintercept = as.numeric(markers_file[condition, 10]),
+                      lwd = 1,linetype = "dashed") + # last trigger
+           geom_smooth(method = 'lm', formula = y ~ x,
+                       col = "forestgreen", lwd = 1.5) + # linear model
+           stat_poly_eq(aes(label = paste(after_stat(eq.label),
+                                          # after_stat(adj.rr.label),
+                                          after_stat(rr.label), sep = "*\", \"*")),
+                        geom = "label",
+                        label.x = 0.34 * max(df_to_plot$time),
+                        color = "forestgreen") +
+           # stat_poly_line() +
+               labs(x = "Time (s)",
+                    y = "Oxygenated Hemoglobin",
+                    subtitle = name_roi) +
+           apa7
+  
+       }
+  
+       # Store the plot
+       list_plot[[roi]] <- plot_roi
+  
+     }
+  
+     # ------ Combine plots
+     plot_final <-
+       ggarrange(list_plot[[1]], list_plot[[2]], list_plot[[3]], list_plot[[4]],
+               ncol = 2, nrow = 2,
+               font.label = list(size = 27))
+     print(plot_final)
+  
+     # ------ Add title
+     # Extract current condition
+     if (condition == 1) {
+       cond = "Audiobook"
+     } else if (condition == 2) {
+       cond = "Control"
+     } else if (condition == 3) {
+       cond = "Music"
+     }
+  
+     # Add title to figure
+     annotate_figure(plot_final, top = text_grob(cond, color = "black",
+                                                 face = "bold", size = 30))
+  
+     # ------ Save plot
+     # Extract current condition name
+     if (condition == 1) {
+       cond = "A"
+     } else if (condition == 2) {
+       cond = "C"
+     } else if (condition == 3) {
+       cond = "M"
+     }
+  
+     # Generate plot name
+     name_plot = sprintf("sub-%03d_cond-%s.png", participant_id, cond)
+  
+     # Write plot file
+     ggsave(plot = last_plot(),
+            paste0(gsub("1_code/", "",
+                        here("2_output/plots/nirs/quadratic_fit/2_experiment/")),
+                   name_plot),
+            width = 35,
+            height = 25,
+            units = "cm")
+  
+   }
+  
+  # ------ Compute D value as percentage of VT1+5% period
+  for (i in 1:3){
+    for (k in 1:4){
+      time_max[i, k] #<- 
+        #(time_max[i, k] / as.numeric(markers_file[i, 10])) * 100
+    }
+  }
+  
+  # ------ Format
+  export_time_max = cbind(sub = c(repmat(participant_id, 3, 1)),
+                          ses = c("audiobook", "control", "music"), 
+                          time_max)
+  export_time_max <- as.data.frame(export_time_max)
+  
+  export_coeff_linear = cbind(sub = c(repmat(participant_id, 3, 1)),
+                              ses = c("audiobook", "control", "music"), 
+                              coeff_linear)
+  export_coeff_linear <- as.data.frame(export_coeff_linear)
+  
+  # ------ Save data
+  write_xlsx(export_time_max,
+             sprintf(gsub("1_code/", "",
+                          here("2_output/sub-%03d_time-max.xlsx")),
+                     participant_id))
+
+  write_xlsx(export_coeff_linear,
+             sprintf(gsub("1_code/", "",
+                          here("2_output/sub-%03d_coeff-linear.xlsx")),
+                     participant_id))
+
+}
+      
+```
+
